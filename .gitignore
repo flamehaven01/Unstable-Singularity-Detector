@@ -231,3 +231,9 @@ stage2_residual_tracker.png
 .Trashes
 ehthumbs.db
 Thumbs.db
+results/ci_plots/
+docs/patch/
+docs/unstable-singularity-detector_blueprint.md
+docs/*translation*/
+benchmark.json
+Discovering new solutions to century-old problems in fluid dynamics/

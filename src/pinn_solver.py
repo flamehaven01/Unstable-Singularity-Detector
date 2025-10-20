@@ -411,6 +411,55 @@ class PINNSolver:
         logger.info(f"Generated {n_interior + n_boundary + n_initial} training points")
         return self.training_points
 
+    def resample_interior_points(self,
+                                 residual_values: torch.Tensor,
+                                 coordinates: torch.Tensor,
+                                 n_interior: Optional[int] = None,
+                                 epsilon: float = 1e-12) -> torch.Tensor:
+        """
+        Resample interior collocation points proportional to the observed residual.
+
+        Args:
+            residual_values: Residual magnitudes evaluated on ``coordinates``.
+            coordinates: Coordinate tensor aligned with ``residual_values``.
+            n_interior: Number of samples to draw (defaults to current interior count).
+            epsilon: Small constant to avoid zero-probability sampling.
+
+        Returns:
+            Resampled interior points tensor.
+        """
+        if self.training_points is None or 'interior' not in self.training_points:
+            raise ValueError("Interior points are not initialised. Call generate_training_points() first.")
+
+        if coordinates.shape[0] != residual_values.shape[0]:
+            raise ValueError("Residual values and coordinates must have matching first dimension.")
+
+        if n_interior is None:
+            n_interior = self.training_points['interior'].shape[0]
+
+        # Prepare sampling probabilities
+        weights = residual_values.detach().abs().flatten().to(torch.float64)
+        if weights.numel() == 0:
+            logger.warning("No residual values provided for adaptive sampling; keeping existing interior points.")
+            return self.training_points['interior']
+
+        weights = weights + epsilon
+        weight_sum = weights.sum()
+        if weight_sum <= 0:
+            logger.warning("Residual weights sum to zero; keeping existing interior points.")
+            return self.training_points['interior']
+
+        probs = (weights / weight_sum).to(self.config.device)
+        coords = coordinates.to(self.config.device, dtype=self.config.precision)
+
+        indices = torch.multinomial(probs, n_interior, replacement=True)
+        sampled_points = coords[indices]
+        sampled_points.requires_grad_(True)
+
+        self.training_points['interior'] = sampled_points
+        logger.info(f"Resampled {n_interior} interior points using residual-weighted importance sampling.")
+        return sampled_points
+
     def compute_derivatives(self, u: torch.Tensor,
                           coordinates: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -688,6 +737,35 @@ class PINNSolver:
             logger.info(f"Solution plot saved to {save_path}")
 
         plt.show()
+
+
+class LambdaHyperNet(nn.Module):
+    """
+    Simple hypernetwork that predicts lambda scaling factors from instability order.
+
+    Acts as a learnable mapping n -> lambda to support adaptive spectral scaling.
+    """
+
+    def __init__(self, hidden_dim: int = 32):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, order: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            order: Tensor of instability orders (shape [N] or [N, 1])
+        Returns:
+            Predicted lambda scaling factors.
+        """
+        if order.ndim == 1:
+            order = order.unsqueeze(-1)
+        return self.mlp(order.to(dtype=torch.float32))
 
 # Example usage and testing
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ Automatic logging of parameters, metrics, artifacts, and models.
 
 import os
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 from pathlib import Path
 import json
 import pickle
@@ -21,6 +21,8 @@ from mlflow.tracking import MlflowClient
 from omegaconf import DictConfig, OmegaConf
 import matplotlib.pyplot as plt
 import h5py
+
+from utils.certificates import build_residual_certificate, save_residual_certificate
 
 logger = logging.getLogger(__name__)
 
@@ -374,6 +376,47 @@ class ExperimentTracker:
         except Exception as e:
             logger.error(f"Failed to log singularity results: {e}")
 
+    def replay_run(self, run_id: str, output_dir: Union[str, Path] = "replay") -> Optional[Dict[str, Any]]:
+        """
+        Restore configuration and artifacts from a previous MLflow run.
+
+        Args:
+            run_id: Identifier of the MLflow run to restore.
+            output_dir: Local directory for downloaded artifacts.
+
+        Returns:
+            Summary dictionary containing params, metrics, and artifact path if successful.
+        """
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        try:
+            run = self.client.get_run(run_id)
+
+            def _download_artifacts(prefix: str = "") -> None:
+                artifacts = self.client.list_artifacts(run_id, prefix)
+                for artifact in artifacts:
+                    if artifact.is_dir:
+                        _download_artifacts(artifact.path)
+                    else:
+                        local_file = self.client.download_artifacts(run_id, artifact.path, dst_path=output_path)
+                        logger.info(f"[Replay] Downloaded artifact {artifact.path} -> {local_file}")
+
+            _download_artifacts()
+
+            replay_summary = {
+                "run_id": run_id,
+                "params": dict(run.data.params),
+                "metrics": dict(run.data.metrics),
+                "artifacts_dir": str(output_path.resolve())
+            }
+            logger.info(f"[Replay] Restored run {run_id} to {replay_summary['artifacts_dir']}")
+            return replay_summary
+
+        except Exception as exc:
+            logger.error(f"[Replay] Failed to restore run {run_id}: {exc}")
+            return None
+
     def compare_runs(self,
                     run_ids: List[str],
                     metrics: Optional[List[str]] = None) -> Dict:
@@ -502,6 +545,110 @@ class ExperimentTracker:
         logger.info(f"[Provenance] commit={commit[:8]}, host={hostname}, seed={seed}")
 
         return {"commit": commit, "hostname": hostname, "seed": seed}
+
+    def generate_pdf_report(self,
+                            run_id: str,
+                            output_file: str = "experiment_report.pdf") -> Optional[str]:
+        """
+        Generate a lightweight PDF experiment summary.
+
+        Requires WeasyPrint and its system dependencies to be installed; otherwise a warning is raised.
+        """
+        try:
+            from weasyprint import HTML  # type: ignore
+        except ImportError:
+            logger.error("[Report] WeasyPrint is not installed. Skipping PDF report generation.")
+            return None
+
+        run = self.client.get_run(run_id)
+        params = json.dumps(run.data.params, indent=2, default=str)
+        metrics = json.dumps(run.data.metrics, indent=2, default=str)
+
+        html = f"""
+        <html>
+          <head><meta charset='utf-8'><title>Experiment Report</title></head>
+          <body>
+            <h1>Experiment Report</h1>
+            <h2>Run ID: {run_id}</h2>
+            <h3>Parameters</h3>
+            <pre>{params}</pre>
+            <h3>Metrics</h3>
+            <pre>{metrics}</pre>
+          </body>
+        </html>
+        """
+
+        try:
+            HTML(string=html).write_pdf(output_file)
+            logger.info(f"[Report] PDF saved to {output_file}")
+            return output_file
+        except Exception as exc:
+            logger.error(f"[Report] Failed to generate PDF: {exc}")
+            return None
+
+    def generate_residual_certificate(
+        self,
+        optimization_result: Dict[str, Any],
+        tolerance: float,
+        *,
+        residual_history: Optional[Sequence[Any]] = None,
+        safety_factor: float = 0.0,
+        output_dir: Union[str, Path] = "certificates",
+        filename: str = "residual_certificate",
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Build and persist a residual error certificate for an optimisation run.
+
+        Args:
+            optimization_result: Output dictionary returned by the optimiser.
+            tolerance: Residual tolerance the run is expected to satisfy.
+            residual_history: Optional sequence of residual norms per iteration.
+            safety_factor: Fractional safety margin (0.1 means 10% slack).
+            output_dir: Directory used to store certificate artefacts.
+            filename: Base filename (without extension) for the certificate files.
+            metadata: Optional extra metadata to embed in the certificate.
+
+        Returns:
+            Tuple of (ResidualCertificate, dict with output paths).
+        """
+        loss_history = optimization_result.get("loss_history") or []
+        if not loss_history and "loss" in optimization_result:
+            loss_history = [optimization_result["loss"]]
+        if not loss_history:
+            raise ValueError("optimization_result must provide loss_history or loss")
+
+        gradient_history = optimization_result.get("gradient_norm_history") or []
+        residual_history = residual_history or optimization_result.get("residual_history")
+
+        meta = dict(metadata or {})
+        meta.setdefault("iterations_reported", optimization_result.get("iterations"))
+        if optimization_result.get("gradient_norm") is not None:
+            meta.setdefault("final_gradient_norm", optimization_result.get("gradient_norm"))
+
+        certificate = build_residual_certificate(
+            loss_history=loss_history,
+            tolerance=tolerance,
+            residual_history=residual_history,
+            gradient_history=gradient_history,
+            safety_factor=safety_factor,
+            metadata=meta,
+        )
+
+        output_dir = Path(output_dir)
+        paths = save_residual_certificate(certificate, output_dir, base_name=filename)
+        logger.info(
+            "[Certificate] Residual certificate stored at %s (holds=%s)",
+            output_dir,
+            certificate.holds,
+        )
+
+        if self.active_run:
+            artifact_folder = str(output_dir.name)
+            for artifact_path in paths.values():
+                mlflow.log_artifact(str(artifact_path), artifact_path=artifact_folder)
+
+        return certificate, paths
 
     # Patch #9.4: Markdown Summary
     def summarize_run(self, run_id: str = None, output_file: str = "experiment_summary.md"):

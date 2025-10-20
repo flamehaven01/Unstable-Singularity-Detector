@@ -17,12 +17,67 @@ import torch
 import torch.nn as nn
 import numpy as np
 import logging
-from typing import Dict, List, Tuple, Optional, Callable, Union
+import inspect
+from typing import Any, Dict, List, Tuple, Optional, Callable, Union
 from dataclasses import dataclass
 from scipy.fft import fft2, fftfreq
 import matplotlib.pyplot as plt
 
+try:
+    from .gauss_newton_optimizer_enhanced import MetaOptimizer
+except ImportError:  # pragma: no cover - fallback for script execution
+    from gauss_newton_optimizer_enhanced import MetaOptimizer  # type: ignore
+
+try:
+    import pytorch_lightning as pl  # type: ignore
+    _LIGHTNING_AVAILABLE = True
+except ImportError:
+    pl = None  # type: ignore
+    _LIGHTNING_AVAILABLE = False
+
+try:
+    from accelerate import Accelerator  # type: ignore
+    _ACCELERATE_AVAILABLE = True
+except ImportError:
+    Accelerator = None  # type: ignore
+    _ACCELERATE_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
+
+
+if _LIGHTNING_AVAILABLE:
+    class PINNLightningModule(pl.LightningModule):
+        """Minimal Lightning wrapper for PINN training."""
+
+        def __init__(self,
+                     network: nn.Module,
+                     optimizer_cls: Callable = torch.optim.Adam,
+                     lr: float = 1e-3):
+            super().__init__()
+            self.model = network
+            self.optimizer_cls = optimizer_cls
+            self.lr = lr
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.model(x)
+
+        def training_step(self, batch, batch_idx: int):
+            inputs, targets = batch
+            outputs = self(inputs)
+            loss = torch.mean((outputs - targets) ** 2)
+            self.log("train_loss", loss, on_step=True, prog_bar=True)
+            return loss
+
+        def configure_optimizers(self):
+            return self.optimizer_cls(self.model.parameters(), lr=self.lr)
+
+
+else:
+    class PINNLightningModule:  # type: ignore
+        """Stub Lightning module when PyTorch Lightning is unavailable."""
+
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("PyTorch Lightning is not installed; enable it to use Lightning features.")
 
 
 @dataclass
@@ -45,6 +100,14 @@ class MultiStageConfig:
     device: str = "auto"
     verbose: bool = True
     checkpoint_frequency: int = 10000
+    stage1_learning_rate: float = 1e-3
+    meta_optimizer_lr: float = 1e-4
+    use_fsdp: bool = False
+    use_lightning: bool = False
+    use_accelerate: bool = False
+    optimizer: Optional[str] = None
+    lightning_trainer_fn: Optional[Callable[..., Dict]] = None
+    accelerate_training_fn: Optional[Callable[..., Dict]] = None
 
     def __post_init__(self):
         if self.stage1_hidden_layers is None:
@@ -218,6 +281,9 @@ class MultiStageTrainer:
         logger.info("="*60)
 
         self.stage1_network = network.to(self.device)
+        self._wrap_stage1_with_fsdp()
+
+        optimizer = self._configure_stage1_optimizer(self.stage1_network)
 
         # Mixed Precision Training (Patch #3.1)
         scaler = torch.cuda.amp.GradScaler(enabled=(self.device.type == "cuda"))
@@ -225,14 +291,25 @@ class MultiStageTrainer:
         if use_amp:
             logger.info("[AMP] Mixed precision training enabled for Stage 1")
 
-        history = train_function(
-            network=self.stage1_network,
-            max_epochs=self.config.stage1_epochs,
-            target_loss=self.config.stage1_target_residual,
-            checkpoint_freq=self.config.checkpoint_frequency,
-            use_amp=use_amp,
-            scaler=scaler
-        )
+        history = None
+
+        if self.config.use_lightning:
+            history = self._train_stage1_with_lightning(optimizer)
+        elif self.config.use_accelerate:
+            history = self._train_stage1_with_accelerate(
+                train_function,
+                optimizer,
+                use_amp,
+                scaler
+            )
+
+        if history is None:
+            history = self._invoke_stage1_training(
+                train_function,
+                optimizer,
+                use_amp,
+                scaler
+            )
 
         # Validate
         val_results = validation_function(self.stage1_network)
@@ -488,6 +565,141 @@ class MultiStageTrainer:
             logger.info(f"Training progress plot saved to {save_path}")
 
         plt.show()
+
+    @staticmethod
+    def _callable_parameters(func: Callable) -> set:
+        """Return parameter names accepted by a callable."""
+        try:
+            return set(inspect.signature(func).parameters.keys())
+        except (TypeError, ValueError):
+            return set()
+
+    def _configure_stage1_optimizer(self, network: nn.Module):
+        """Select and initialise the optimiser according to configuration."""
+        opt_name = getattr(self.config, "optimizer", None)
+
+        if opt_name == "meta":
+            logger.info("[Optimizer] Using MetaOptimizer (Adam base).")
+            return MetaOptimizer(
+                network.parameters(),
+                torch.optim.Adam,
+                meta_lr=self.config.meta_optimizer_lr,
+                lr=self.config.stage1_learning_rate
+            )
+
+        if opt_name == "kfac":
+            logger.info("[Optimizer] Using K-FAC preconditioner (handled externally).")
+            return None
+
+        if opt_name not in (None, "meta", "kfac"):
+            logger.warning(f"[Optimizer] Unknown optimizer '{opt_name}'. Falling back to default training function.")
+
+        return None
+
+    def _wrap_stage1_with_fsdp(self) -> None:
+        """Optionally wrap the stage 1 network with FSDP."""
+        if not getattr(self.config, "use_fsdp", False):
+            return
+
+        try:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # type: ignore
+        except ImportError:
+            logger.error("[Distributed] FSDP requested but not available. Skipping distributed wrapping.")
+            self.config.use_fsdp = False
+            return
+
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            logger.warning("[Distributed] torch.distributed not initialised; cannot enable FSDP.")
+            self.config.use_fsdp = False
+            return
+
+        self.stage1_network = FSDP(self.stage1_network)
+        logger.info("[Distributed] Stage 1 network wrapped with FSDP.")
+
+    def _train_stage1_with_lightning(self, optimizer) -> Optional[Dict[str, Any]]:
+        """Delegate stage 1 training to a PyTorch Lightning trainer if configured."""
+        if not self.config.use_lightning:
+            return None
+
+        if not _LIGHTNING_AVAILABLE:
+            logger.error("[Lightning] PyTorch Lightning not installed; falling back to standard training.")
+            return None
+
+        if self.config.lightning_trainer_fn is None:
+            logger.error("[Lightning] No `lightning_trainer_fn` provided; unable to run Lightning training.")
+            return None
+
+        try:
+            return self.config.lightning_trainer_fn(self.stage1_network, optimizer, self.config)
+        except Exception as exc:
+            logger.error(f"[Lightning] Training callback failed: {exc}")
+            return None
+
+    def _train_stage1_with_accelerate(self,
+                                      train_function: Callable,
+                                      optimizer,
+                                      use_amp: bool,
+                                      scaler) -> Optional[Dict[str, Any]]:
+        """Delegate stage 1 training to HuggingFace Accelerate if configured."""
+        if not self.config.use_accelerate:
+            return None
+
+        if not _ACCELERATE_AVAILABLE:
+            logger.error("[Accelerate] accelerate not installed; falling back to standard training.")
+            return None
+
+        if self.config.accelerate_training_fn is None:
+            logger.error("[Accelerate] No `accelerate_training_fn` provided; unable to use accelerate.")
+            return None
+
+        accelerator = Accelerator()
+        try:
+            return self.config.accelerate_training_fn(
+                self.stage1_network,
+                accelerator,
+                train_function,
+                optimizer,
+                self.config
+            )
+        except Exception as exc:
+            logger.error(f"[Accelerate] Training callback failed: {exc}")
+            return None
+
+    def _invoke_stage1_training(self,
+                                train_function: Callable,
+                                optimizer,
+                                use_amp: bool,
+                                scaler) -> Dict[str, Any]:
+        """Invoke the user-provided training function with optional arguments."""
+        params = self._callable_parameters(train_function)
+        train_kwargs = {
+            "network": self.stage1_network,
+            "max_epochs": self.config.stage1_epochs,
+            "target_loss": self.config.stage1_target_residual,
+            "checkpoint_freq": self.config.checkpoint_frequency
+        }
+
+        if "use_amp" in params:
+            train_kwargs["use_amp"] = use_amp
+        if "scaler" in params:
+            train_kwargs["scaler"] = scaler
+        if optimizer is not None and "optimizer" in params:
+            train_kwargs["optimizer"] = optimizer
+        elif self.config.optimizer == "kfac" and "optimizer" in params:
+            train_kwargs["optimizer"] = "kfac"
+        if "device" in params:
+            train_kwargs["device"] = self.device
+
+        history = train_function(**train_kwargs)
+
+        if history is None:
+            return {}
+
+        if isinstance(history, dict):
+            return history
+
+        # Fallback: wrap non-dict outputs
+        return {"loss_history": history}
 
 
 def save_multistage_checkpoint(trainer: MultiStageTrainer,

@@ -45,6 +45,11 @@ class GaussNewtonConfig:
     # Gradient clipping (increased for ill-conditioned problems)
     gradient_clip: float = 10.0
 
+    # Krylov solver (optional)
+    use_krylov_solver: bool = False
+    krylov_max_iter: int = 200
+    krylov_tol: float = 1e-10
+
     # EMA for Hessian approximation (DeepMind enhancement)
     use_ema_hessian: bool = True
     ema_decay: float = 0.9  # β for exponential moving average
@@ -66,6 +71,39 @@ class GaussNewtonConfig:
     # Precision and verbosity
     precision: torch.dtype = torch.float64
     verbose: bool = True
+
+
+class MetaOptimizer:
+    """Light-weight meta-optimizer that wraps a base optimizer and adjusts its LR."""
+
+    def __init__(self,
+                 params,
+                 base_optimizer_cls,
+                 meta_lr: float = 1e-3,
+                 lr: float = 1e-3,
+                 **kwargs):
+        self.meta_lr = meta_lr
+        self.base_optimizer = base_optimizer_cls(params, lr=lr, **kwargs)
+
+    def zero_grad(self):
+        self.base_optimizer.zero_grad()
+
+    @property
+    def param_groups(self):
+        return self.base_optimizer.param_groups
+
+    def state_dict(self):
+        return self.base_optimizer.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.base_optimizer.load_state_dict(state_dict)
+
+    def step(self, closure=None):
+        result = self.base_optimizer.step(closure)
+        noise = 1.0 + self.meta_lr * torch.randn(1, dtype=torch.float64).item()
+        for group in self.base_optimizer.param_groups:
+            group["lr"] = max(group.get("lr", 1e-3) * noise, 1e-12)
+        return result
 
 
 class Rank1HessianEstimator:
@@ -304,12 +342,41 @@ class HighPrecisionGaussNewtonEnhanced:
             damped_JTJ = damped_JTJ * precond.unsqueeze(0)
             JTr = JTr * precond
 
+        rhs = -JTr
+
+        # Optional Krylov solver for large systems
+        if self.config.use_krylov_solver:
+            try:
+                cg_kwargs = {"maxiter": self.config.krylov_max_iter}
+                try:
+                    step, cg_info = torch.linalg.cg(
+                        damped_JTJ,
+                        rhs,
+                        atol=self.config.krylov_tol,
+                        **cg_kwargs
+                    )
+                except TypeError:
+                    # Older PyTorch versions may not support 'atol'; retry without it
+                    step, cg_info = torch.linalg.cg(
+                        damped_JTJ,
+                        rhs,
+                        **cg_kwargs
+                    )
+
+                if cg_info == 0:
+                    logger.info("[Gauss-Newton] Solved linear system via Krylov CG")
+                    return step
+
+                logger.warning(f"[Gauss-Newton] CG solver returned info={cg_info}; falling back to direct solve")
+            except (RuntimeError, AttributeError) as err:
+                logger.warning(f"[Gauss-Newton] Krylov solver unavailable ({err}); falling back to direct solve")
+
         try:
             # Solve linear system
-            step = torch.linalg.solve(damped_JTJ, -JTr)
+            step = torch.linalg.solve(damped_JTJ, rhs)
             return step
         except RuntimeError as e:
-            logger.warning(f"Linear system solve failed: {e}. Using gradient descent.")
+            logger.warning(f"Linear system solve failed: {e}. Using gradient descent fallback.")
             gradient = self._compute_gradient(residual, jacobian)
             return -self.learning_rate * gradient
 
@@ -338,6 +405,46 @@ class HighPrecisionGaussNewtonEnhanced:
 
             if self.config.verbose and iteration % 100 == 0:
                 logger.info(f"  Auto LR updated: {self.learning_rate:.2e} (curvature={curvature:.2e})")
+
+    def step_with_kfac(self,
+                       loss_fn: Callable,
+                       dataloader,
+                       model: nn.Module,
+                       lr: float = 1e-3,
+                       factor_decay: float = 0.95) -> None:
+        """
+        Perform a single K-FAC preconditioned optimisation step.
+
+        Args:
+            loss_fn: Callable taking (predictions, targets) -> loss tensor.
+            dataloader: Iterable yielding batches of (inputs, targets).
+            model: Model to update using K-FAC.
+            lr: K-FAC optimiser learning rate.
+            factor_decay: Decay rate for Kronecker factors.
+        """
+        try:
+            import kfac  # type: ignore
+        except ImportError:
+            logger.warning("[Optimizer] K-FAC not installed. Skipping K-FAC update.")
+            return
+
+        optimizer = kfac.KFACOptimizer(model, lr=lr, factor_decay=factor_decay)
+        model.train()
+
+        for batch in dataloader:
+            if isinstance(batch, (list, tuple)) and len(batch) == 2:
+                inputs, targets = batch
+            else:
+                logger.warning("[Optimizer] Unexpected batch format for K-FAC step; skipping batch.")
+                continue
+
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = loss_fn(outputs, targets)
+            loss.backward()
+            optimizer.step()
+
+        logger.info("[Optimizer] Completed K-FAC preconditioned step.")
 
     def _line_search(self, compute_residual_fn: Callable,
                     parameters: torch.Tensor,

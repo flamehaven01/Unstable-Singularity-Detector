@@ -249,6 +249,7 @@ class TestUnstableSingularityDetector:
         assert hasattr(self.detector, 'max_instability_order')
 
     @pytest.mark.slow
+    @pytest.mark.benchmark
     def test_performance_benchmark(self):
         """Benchmark detection performance"""
         import time
@@ -272,6 +273,31 @@ class TestUnstableSingularityDetector:
 
         # Performance test - just ensure it doesn't hang indefinitely
         assert detection_time < 120, f"Detection too slow: {detection_time:.2f}s"
+
+    def test_extract_spatial_profile_3d(self):
+        detector = UnstableSingularityDetector()
+        solution_slice = torch.arange(8 * 8 * 8, dtype=torch.float64).reshape(8, 8, 8)
+        spatial_grid = torch.zeros(3, 8, 8, 8, dtype=torch.float64)
+        profile = detector._extract_spatial_profile(solution_slice, (4, 4, 4), spatial_grid)
+        assert profile.ndim == 2
+        assert profile.size > 0
+
+    def test_lambda_estimation_3d(self):
+        detector = UnstableSingularityDetector()
+        time_steps = 20
+        grid_shape = (8, 8, 8)
+        times = torch.linspace(0.9, 0.999, time_steps)
+        T_blowup = 1.0
+        lam_true = 1.2
+        base_field = torch.ones(grid_shape, dtype=torch.float64)
+        local_solution = []
+        for t in times:
+            local_solution.append(base_field * (T_blowup - t) ** (-lam_true))
+        local_solution = torch.stack(local_solution, dim=0)
+
+        estimate, confidence = detector._estimate_lambda_parameter(local_solution, times, (3, 3, 3))
+        assert estimate > 0
+        assert 0.0 <= confidence <= 1.0
 
     def test_gpu_compatibility(self):
         """Test GPU acceleration if available"""

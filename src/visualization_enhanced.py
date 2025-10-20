@@ -25,9 +25,20 @@ try:
     MESHIO_AVAILABLE = True
 except ImportError:
     MESHIO_AVAILABLE = False
-    logger.warning("[VTK Export] meshio not installed - VTK export disabled")
+    logging.getLogger(__name__).warning("[VTK Export] meshio not installed - VTK export disabled")
 
 logger = logging.getLogger(__name__)
+
+try:
+    import dash  # type: ignore
+    from dash import dcc, html  # type: ignore
+    DASH_AVAILABLE = True
+except ImportError:
+    DASH_AVAILABLE = False
+    dash = None  # type: ignore
+    dcc = None  # type: ignore
+    html = None  # type: ignore
+    logger.warning("[Dashboard] dash not installed - interactive dashboards disabled")
 
 
 @dataclass
@@ -510,6 +521,124 @@ def export_to_vtk(filename: str, coords: torch.Tensor, u_pred: torch.Tensor):
 
     except Exception as e:
         logger.error(f"[VTK Export] Failed: {e}")
+
+
+def launch_residual_dashboard(residual_history: List[float]) -> None:
+    """Launch an interactive dashboard for residual convergence monitoring."""
+    if not DASH_AVAILABLE:
+        logger.error("[Dashboard] dash is not installed. Install via 'pip install dash' to enable dashboards.")
+        return
+
+    history = [float(value) for value in residual_history]
+    app = dash.Dash(__name__)
+    app.layout = html.Div([
+        html.H2("Residual Convergence Dashboard"),
+        dcc.Graph(
+            id="residual-graph",
+            figure={
+                "data": [
+                    go.Scatter(y=history, mode="lines", name="Residual")
+                ],
+                "layout": go.Layout(
+                    title="Residual Convergence",
+                    xaxis={"title": "Epoch"},
+                    yaxis={"title": "Residual (log scale)", "type": "log"}
+                )
+            }
+        )
+    ])
+    logger.info("[Dashboard] Starting residual convergence dashboard at http://127.0.0.1:8050")
+    app.run_server(debug=False, use_reloader=False)
+
+
+def plot_lambda_instability_pattern(lambdas: List[float],
+                                    confidence: List[float],
+                                    save_path: Optional[str] = None) -> None:
+    """Plot lambda instability pattern with regression diagnostics using Matplotlib."""
+    if not lambdas:
+        logger.warning("No lambda values provided for instability pattern plot.")
+        return
+
+    try:
+        import matplotlib.pyplot as plt  # Local import for headless environments
+        import numpy as np
+        from sklearn.linear_model import LinearRegression
+    except ImportError as exc:
+        logger.error(f"[Visualization] Missing dependency for instability pattern plot: {exc}")
+        return
+
+    x = np.arange(len(lambdas)).reshape(-1, 1)
+    y = np.asarray(lambdas, dtype=float)
+    conf = np.asarray(confidence, dtype=float) if confidence else None
+
+    model = LinearRegression()
+    model.fit(x, y)
+    y_pred = model.predict(x)
+    r_squared = model.score(x, y)
+
+    plt.figure(figsize=(8, 5))
+    plt.errorbar(range(len(lambdas)), y, yerr=conf, fmt='o',
+                 label='Lambda (CI)' if conf is not None else 'Lambda')
+    plt.plot(range(len(lambdas)), y_pred, '--', label=f'Linear Fit (R^2={r_squared:.3f})')
+    plt.xlabel('Instability Order')
+    plt.ylabel('Lambda Estimate')
+    plt.title('Instability Pattern with Regression Diagnostics')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+        logger.info(f"[Visualization] Saved lambda instability pattern to {save_path}")
+    plt.close()
+
+
+def launch_comparison_dashboard(stage1_data: torch.Tensor,
+                                stage2_data: torch.Tensor,
+                                coords: torch.Tensor) -> None:
+    """Interactive web UI to compare Stage 1 and Stage 2 predictions."""
+    if not DASH_AVAILABLE:
+        logger.error("[Dashboard] dash is not installed. Install via 'pip install dash' to enable dashboards.")
+        return
+
+    import plotly.express as px  # Local import to keep dependency optional
+
+    stage1_vals = stage1_data.detach().cpu().numpy().flatten()
+    stage2_vals = stage2_data.detach().cpu().numpy().flatten()
+    coords_np = coords.detach().cpu().numpy()
+
+    fig1 = px.scatter(x=coords_np[:, 0], y=stage1_vals, title="Stage 1 Predictions")
+    fig2 = px.scatter(x=coords_np[:, 0], y=stage2_vals, title="Stage 2 Predictions")
+
+    app = dash.Dash(__name__)
+    app.layout = html.Div([
+        html.H2("Stage Comparison Dashboard"),
+        dcc.Graph(figure=fig1),
+        dcc.Graph(figure=fig2)
+    ])
+    logger.info("[Dashboard] Starting stage comparison dashboard at http://127.0.0.1:8050")
+    app.run_server(debug=False, use_reloader=False)
+
+
+def plot_lambda_timeseries(lambda_history: List[float],
+                           save_path: Optional[str] = None) -> None:
+    """Plot lambda estimates as a time-series."""
+    if not lambda_history:
+        logger.warning("No lambda history provided for time-series plot.")
+        return
+
+    import matplotlib.pyplot as plt  # Local import for compatibility with headless backends
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(lambda_history, marker='o')
+    plt.xlabel('Training Step')
+    plt.ylabel('Lambda Estimate')
+    plt.title('Lambda Evolution Over Training')
+    plt.grid(True, alpha=0.3)
+
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+        logger.info(f"[Visualization] Saved lambda time-series to {save_path}")
+    plt.close()
 
 
 # HTML Report Generator (Patch #9.2)

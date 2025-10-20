@@ -56,10 +56,10 @@ Clear overview of what has been implemented from the DeepMind paper:
 - **Comprehensive Testing**: 99/101 tests passing with automated CI/CD
 
 ### Recent Enhancements (October 2025)
-- **Reproducibility Validation**: Automated CI pipeline with lambda comparison
-- **Bug Fixes**: Gradient clipping improvements for ill-conditioned problems
-- **Testing Utilities**: Torch shim for edge case validation
-- **Documentation**: Enhanced guides and API references
+- **Reproducibility & Proofs**: Reproduction CI with lambda comparison plus residual certificates for audit trails
+- **Gauss–Newton Upgrades**: Meta/K-FAC hooks and safer Krylov fallback for high-precision solves
+- **3D Detection Support**: Spatial slicing, residuals, and tests extended to volumetric outputs
+- **CFD Bridge Prototype**: `scripts/cfd_bridge.py` links external solver snapshots to the detector pipeline
 
 See [Recent Updates](#recent-updates) for detailed changelog.
 
@@ -110,6 +110,15 @@ python src/web_interface.py
 #  - 3D visualization
 #  - Real-time monitoring
 ```
+
+### Option 4: External CFD Snapshot
+
+```bash
+python scripts/cfd_bridge.py path/to/cfd_output.npz \ 
+  --output results/cfd_summary.json --certificate
+```
+
+Generates detection results (and optional residual certificates) from solver exports.
 
 ### Lambda Prediction (Ground Truth Validated)
 
@@ -887,7 +896,7 @@ This project is inspired by the groundbreaking research published by:
 ![Documentation](https://img.shields.io/badge/documentation-comprehensive-success)
 ![Status](https://img.shields.io/badge/status-production%20ready-success)
 
-**Last Updated**: 2025-09-30
-**Version**: 1.0.0
+**Last Updated**: 2025-10-20
+**Version**: 1.4.0
 **Python**: 3.8+
 **PyTorch**: 2.0+

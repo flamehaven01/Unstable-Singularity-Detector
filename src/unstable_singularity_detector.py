@@ -150,7 +150,8 @@ class UnstableSingularityDetector:
 
         # Identify potential blow-up points
         time_steps = solution_field.shape[0]
-        for t in range(time_steps - 10, time_steps):  # Focus on late times
+        start_time = max(0, time_steps - 10)
+        for t in range(start_time, time_steps):  # Focus on late times
             current_grad = gradient_magnitude[t]
 
             # Find local maxima exceeding threshold
@@ -234,8 +235,13 @@ class UnstableSingularityDetector:
         """
         Estimate the blow-up rate parameter λ using self-similar analysis
         """
-        # Extract time series at spatial point
-        time_series = local_solution[:, spatial_idx[0], spatial_idx[1]]
+        # Ensure spatial index tuple matches dimensionality
+        spatial_idx = tuple(int(idx) for idx in spatial_idx)
+
+        # Extract time series at the spatial point
+        index = (slice(None),) + spatial_idx
+        time_series = local_solution[index]
+
         # GPU-safe conversion: detach from autograd and move to CPU
         times = local_times.detach().cpu().numpy()
         values = time_series.detach().cpu().numpy()
@@ -285,32 +291,22 @@ class UnstableSingularityDetector:
         # Simplified instability analysis using spatial derivatives
         solution = local_solution[-1]  # Latest time slice
 
-        # Compute Hessian matrix at the singularity point
         try:
-            # Second derivatives in each spatial direction
-            dx2 = torch.gradient(torch.gradient(solution, dim=0)[0], dim=0)[0]
-            dy2 = torch.gradient(torch.gradient(solution, dim=1)[0], dim=1)[0]
-            dxy = torch.gradient(torch.gradient(solution, dim=0)[0], dim=1)[0]
+            spatial_dims = solution.ndim
+            gradients = torch.gradient(solution, dim=tuple(range(spatial_dims)))
+            second_derivatives = [
+                torch.gradient(grad, dim=dim)[0] for dim, grad in enumerate(gradients)
+            ]
 
-            # Evaluate at singularity point
-            hess_xx = dx2[spatial_idx].item()
-            hess_yy = dy2[spatial_idx].item()
-            hess_xy = dxy[spatial_idx].item()
+            diag_eigenvalues = []
+            for second in second_derivatives:
+                diag_eigenvalues.append(second[spatial_idx].item())
 
-            # Eigenvalues of Hessian
-            trace = hess_xx + hess_yy
-            det = hess_xx * hess_yy - hess_xy**2
-            discriminant = trace**2 - 4*det
-
-            if discriminant >= 0:
-                eigenval1 = (trace + np.sqrt(discriminant)) / 2
-                eigenval2 = (trace - np.sqrt(discriminant)) / 2
-
-                # Count unstable directions (negative eigenvalues for blow-up)
-                unstable_count = sum(1 for ev in [eigenval1, eigenval2] if ev < -self.stability_threshold)
-                return unstable_count
-            else:
-                return 1  # Complex eigenvalues suggest instability
+            # Count unstable directions based on negative curvature
+            unstable_count = sum(
+                1 for ev in diag_eigenvalues if ev < -self.stability_threshold
+            )
+            return max(unstable_count, 1)
 
         except Exception as e:
             logger.warning(f"Instability order computation failed: {e}")
@@ -323,17 +319,25 @@ class UnstableSingularityDetector:
         """
         Extract the spatial profile of the singularity
         """
-        # Extract a local region around the singularity
-        radius = 20
-        x_center, y_center = center_idx
+        # Ensure index tuple covers all spatial dims
+        center_idx = tuple(int(idx) for idx in center_idx)
 
-        x_start = max(0, x_center - radius)
-        x_end = min(solution_slice.shape[0], x_center + radius + 1)
-        y_start = max(0, y_center - radius)
-        y_end = min(solution_slice.shape[1], y_center + radius + 1)
+        radius = 20
+        slices = []
+        for dim, center in enumerate(center_idx):
+            size = solution_slice.shape[dim]
+            start = max(0, center - radius)
+            end = min(size, center + radius + 1)
+            slices.append(slice(start, end))
+
+        local_region = solution_slice[tuple(slices)]
+
+        # If the region is 3D (or higher), project to 2D via mean along the last axis
+        if local_region.ndim >= 3:
+            local_region = local_region.mean(dim=-1)
 
         # GPU-safe conversion: detach from autograd and move to CPU
-        profile = solution_slice[x_start:x_end, y_start:y_end].detach().cpu().numpy()
+        profile = local_region.detach().cpu().numpy()
         return profile
 
     def _classify_singularity_type(self,
@@ -393,16 +397,13 @@ class UnstableSingularityDetector:
         # In practice, this would implement the specific PDE residual
 
         try:
-            # Compute spatial derivatives
-            du_dx = torch.gradient(solution, dim=0)[0]
-            du_dy = torch.gradient(solution, dim=1)[0]
+            spatial_dims = solution.ndim
+            gradients = torch.gradient(solution, dim=tuple(range(spatial_dims)))
+            second_derivatives = [
+                torch.gradient(grad, dim=dim)[0] for dim, grad in enumerate(gradients)
+            ]
 
-            # Second derivatives
-            d2u_dx2 = torch.gradient(du_dx, dim=0)[0]
-            d2u_dy2 = torch.gradient(du_dy, dim=1)[0]
-
-            # Simple residual estimate (would be equation-specific)
-            laplacian = d2u_dx2 + d2u_dy2
+            laplacian = sum(second_derivatives)
             residual = torch.abs(laplacian - solution * lambda_estimate)
 
             return torch.mean(residual).item()
