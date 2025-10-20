@@ -57,8 +57,8 @@ dev = [
     "bandit[toml]>=1.7.0",
 ]
 docs = [
-    "sphinx>=4.0.0",
-    "sphinx-rtd-theme>=1.0.0",
+    "sphinx>=7.0.0,<8.0.0",
+    "sphinx-rtd-theme>=2.0.0",
     "myst-parser>=0.18.0",
 ]
 dvc = [
