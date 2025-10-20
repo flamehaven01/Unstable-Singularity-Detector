@@ -25,18 +25,18 @@ Based on the paper ["Discovering new solutions to century-old problems in fluid 
 
 Clear overview of what has been implemented from the DeepMind paper:
 
-| Component | Paper Reference | Implementation Status | Validation Method | Notes |
-|-----------|----------------|----------------------|-------------------|-------|
-| [Lambda Prediction Formulas](#lambda-prediction-accuracy) | Fig 2e, p.5 | ✅ Complete | Formula-based | <1% error vs published formula |
-| [Funnel Inference](#1-automated-lambda-discovery) (Secant Method) | p.16-17 | ✅ Complete | Method validated | Convergence tested on test problems |
-| [Multi-stage Training](#2-frequency-informed-architecture) Framework | p.17-18 | 🟡 Partial | Framework only | Precision targets configurable, not guaranteed |
-| [Enhanced Gauss-Newton](#3-ultra-high-precision-optimizer) Optimizer | p.7-8 | ✅ Complete | Test problems | High precision achieved on quadratic problems |
-| Rank-1 Hessian Approximation | p.7-8 | ✅ Complete | Unit tested | Memory-efficient implementation |
-| EMA Hessian Smoothing | p.7-8 | ✅ Complete | Unit tested | Exponential moving average |
-| [Physics-Informed Neural Networks](#quick-start) | General | ✅ Complete | Framework | PDE residual computation |
-| Full 3D Navier-Stokes Solver | - | ❌ Not implemented | - | Future work |
-| Actual Blow-up Solution Detection | - | ❌ Not implemented | - | Requires full PDE solver |
-| Computer-Assisted Proof Generation | - | ❌ Not implemented | - | Conceptual framework only |
+| Component | Reference | Status | Validation | Notes |
+|-----------|-----------|--------|-----------|-------|
+| Lambda prediction formulas | Fig. 2e | ✅ Complete | Formula agreement (<1% error) | Matches DeepMind empirical curve |
+| Funnel inference (secant) | Sec. 3 | ✅ Complete | Convergence tests | Automatic lambda bracketing |
+| Multi-stage PINN training | Sec. 4 | 🟡 Partial | Stage 1/2 framework | Precision targets configurable; refinement in progress |
+| Enhanced Gauss–Newton optimizer | Sec. 5 | ✅ Complete | Quadratic tests | Rank-1 Hessian, EMA, Krylov fallback |
+| PINN residual computation | General | ✅ Complete | Unit/integration tests | Supports FP64/FP128 |
+| Residual proof certificates | Supplemental | ✅ Complete | Scripts/CI | `ExperimentTracker.generate_residual_certificate` |
+| 3D detection support | Internal | 🟡 Partial | Synthetic volumetric runs | Spatial slicing/residuals generalized; full Navier–Stokes pending |
+| Full 3D Navier–Stokes solver | Future work | ❌ Not implemented | - | Requires dedicated PDE solver |
+| Actual blow-up solution detection | Future work | ❌ Not implemented | - | Needs full CFD integration |
+| Computer-assisted proof generation | Future work | 🟡 Conceptual | - | Residual certificates and audit trail in progress |
 
 **Legend**:
 - ✅ **Complete & Tested**: Implemented and validated with unit tests
@@ -60,6 +60,7 @@ Clear overview of what has been implemented from the DeepMind paper:
 - **Gauss–Newton Upgrades**: Meta/K-FAC hooks and safer Krylov fallback for high-precision solves
 - **3D Detection Support**: Spatial slicing, residuals, and tests extended to volumetric outputs
 - **CFD Bridge Prototype**: `scripts/cfd_bridge.py` links external solver snapshots to the detector pipeline
+- **v1.4.1 Patch**: Rank-1 Hessian sampler now keeps indices device-safe and scales `Hv` by the actual sample count for consistent curvature estimates
 
 See [Recent Updates](#recent-updates) for detailed changelog.
 
@@ -897,6 +898,6 @@ This project is inspired by the groundbreaking research published by:
 ![Status](https://img.shields.io/badge/status-production%20ready-success)
 
 **Last Updated**: 2025-10-20
-**Version**: 1.4.0
+**Version**: 1.4.1
 **Python**: 3.8+
 **PyTorch**: 2.0+

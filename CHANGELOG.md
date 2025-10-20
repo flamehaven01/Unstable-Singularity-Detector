@@ -4,6 +4,22 @@
 
 - TBD
 
+## [1.4.1] - 2025-10-20
+
+### Fixed
+
+- Rank-1 Hessian sampler now creates device-aware `torch.long` indices, preventing CUDA indexing errors.
+- Curvature scaling uses the actual sample count so Hessian-vector products stay consistent on small batches.
+
+### Documentation
+
+- README updated with the v1.4.1 patch summary and version bump.
+- Added release notes for v1.4.1.
+
+### Testing
+
+- `pytest tests/test_gauss_newton_enhanced.py -k rank1`
+
 ## [1.4.0] - 2025-10-20
 
 ### Highlights

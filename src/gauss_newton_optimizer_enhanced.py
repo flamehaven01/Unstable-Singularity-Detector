@@ -147,12 +147,15 @@ class Rank1HessianEstimator:
         Returns:
             Hv: Hessian-vector product [P]
         """
+        device = jacobian.device
+
         if residual_indices is None:
-            # Random sampling
+            # Random sampling; keep indices on same device as the Jacobian
             n_residuals = jacobian.shape[0]
-            indices = torch.randperm(n_residuals)[:self.batch_size]
+            sample_size = min(self.batch_size, n_residuals)
+            indices = torch.randperm(n_residuals, device=device)[:sample_size]
         else:
-            indices = torch.tensor(residual_indices)
+            indices = torch.tensor(residual_indices, dtype=torch.long, device=device)
 
         # Sample Jacobian rows
         J_sample = jacobian[indices]  # [B, P]
@@ -164,7 +167,8 @@ class Rank1HessianEstimator:
         Hv = torch.matmul(J_sample.T, Jv)  # [P]
 
         # Scale by batch size for unbiased estimate
-        Hv = Hv * (jacobian.shape[0] / self.batch_size)
+        sample_count = max(1, indices.shape[0])
+        Hv = Hv * (jacobian.shape[0] / sample_count)
 
         return Hv
 
